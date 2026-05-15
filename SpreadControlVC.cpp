@@ -33,11 +33,22 @@ const DWORD ADDR_FINAL_TRACE_CALL = 0x005D2CAB;
 const DWORD ADDR_PLAYER_TRACE_CALL = 0x005CC1F1;
 const DWORD ADDR_FINAL_TRACE_FUNC = 0x005CEE60;
 
+// Wanted-level crime accumulation routine. Returning before this function runs
+// prevents crimes from adding wanted points/stars.
+const DWORD ADDR_REGISTER_CRIME = 0x004D1610;
+const DWORD ADDR_UPDATE_WANTED_LEVEL = 0x004D2110;
+
+// Reserve/total ammo decrement in CWeapon::Fire. The nearby clip decrement
+// remains intact so weapons still reload when the current magazine empties.
+const DWORD ADDR_TOTAL_AMMO_DECREMENT = 0x005D4AF5;
+
 // --- Patch data ---
 BYTE g_NOP6[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+BYTE g_NOP3[3] = { 0x90, 0x90, 0x90 };
 
 // Accuracy read patch: MOV AL, XX; NOP NOP NOP NOP
 BYTE g_AccuracyPatch[6] = { 0xB0, 60, 0x90, 0x90, 0x90, 0x90 };
+BYTE g_Return12Patch[6] = { 0xC2, 0x0C, 0x00, 0x90, 0x90, 0x90 };
 
 // Global config values
 float g_SpreadMultiplier = 1.0f;  // NPC spread intensity
@@ -45,6 +56,8 @@ float g_PlayerSpread     = 0.003f; // Player spread constant (~11 deg max at def
 float g_SpreadDegrees    = 2.0f;   // angular spread applied to final trace rays
 float g_MinSpreadUnits   = 0.35f;  // minimum lateral spread for very short traces
 float g_NoTargetDistance = 120.0f; // synthetic ray length when the game has no hit target
+bool g_PoliceIgnore      = false;  // prevent crimes from increasing wanted stars
+bool g_InfiniteAmmo      = true;   // keep reserve ammo from decreasing
 DWORD g_RandomState      = 0;
 int g_TraceLogLimit      = 40;
 int g_TraceLogCount      = 0;
@@ -127,6 +140,17 @@ bool ApplyCallPatch(DWORD addr, const BYTE* expected, void* target, const char* 
     }
 
     BYTE patch[5] = { 0xE8, 0, 0, 0, 0 };
+    *(DWORD*)&patch[1] = (DWORD)target - (addr + 5);
+    return ApplyPatch(addr, expected, patch, sizeof(patch), name);
+}
+
+bool ApplyJumpPatch6(DWORD addr, const BYTE* expected, void* target, const char* name) {
+    if (!BytesMatch(addr, expected, 6)) {
+        Log("SKIP %s at 0x%08X: original bytes did not match this executable.", name, addr);
+        return false;
+    }
+
+    BYTE patch[6] = { 0xE9, 0, 0, 0, 0, 0x90 };
     *(DWORD*)&patch[1] = (DWORD)target - (addr + 5);
     return ApplyPatch(addr, expected, patch, sizeof(patch), name);
 }
@@ -428,6 +452,17 @@ extern "C" __declspec(naked) void FinalTraceWrapper() {
     }
 }
 
+extern "C" __declspec(naked) void NoWantedUpdateWrapper() {
+    __asm {
+        mov dword ptr [ecx], 0
+        mov dword ptr [ecx + 0x20], 0
+        mov byte ptr [ecx + 0x1A], 0
+        mov byte ptr [ecx + 0x19], 0
+        mov word ptr [ecx + 0x1C], 0
+        ret
+    }
+}
+
 void BuildPaths(char* iniPath, size_t iniPathLen) {
     GetModuleFileNameA(g_Module, iniPath, (DWORD)iniPathLen);
     char* ext = strrchr(iniPath, '.');
@@ -486,12 +521,18 @@ void LoadConfig() {
     g_NoTargetDistance = (float)atof(buf);
     if (g_NoTargetDistance < 1.0f) g_NoTargetDistance = 1.0f;
 
+    GetPrivateProfileStringA("Config", "PoliceIgnore", "0", buf, sizeof(buf), iniPath);
+    g_PoliceIgnore = atoi(buf) != 0;
+
+    GetPrivateProfileStringA("Config", "InfiniteAmmo", "1", buf, sizeof(buf), iniPath);
+    g_InfiniteAmmo = atoi(buf) != 0;
+
     GetPrivateProfileStringA("Config", "TraceLogShots", "40", buf, sizeof(buf), iniPath);
     g_TraceLogLimit = atoi(buf);
     if (g_TraceLogLimit < 0) g_TraceLogLimit = 0;
 
-    Log("Config: Accuracy=%u, SpreadMultiplier=%.4f, PlayerSpread=%.8f, SpreadDegrees=%.4f, MinSpreadUnits=%.4f, NoTargetDistance=%.2f, TraceLogShots=%d.",
-        (unsigned int)g_AccuracyPatch[1], g_SpreadMultiplier, g_PlayerSpread, g_SpreadDegrees, g_MinSpreadUnits, g_NoTargetDistance, g_TraceLogLimit);
+    Log("Config: Accuracy=%u, SpreadMultiplier=%.4f, PlayerSpread=%.8f, SpreadDegrees=%.4f, MinSpreadUnits=%.4f, NoTargetDistance=%.2f, PoliceIgnore=%d, InfiniteAmmo=%d, TraceLogShots=%d.",
+        (unsigned int)g_AccuracyPatch[1], g_SpreadMultiplier, g_PlayerSpread, g_SpreadDegrees, g_MinSpreadUnits, g_NoTargetDistance, g_PoliceIgnore ? 1 : 0, g_InfiniteAmmo ? 1 : 0, g_TraceLogLimit);
 }
 
 DWORD WINAPI InitThread(LPVOID) {
@@ -541,6 +582,23 @@ DWORD WINAPI InitThread(LPVOID) {
 
     BYTE playerTraceCall[5] = { 0xE8, 0x6A, 0x2C, 0x00, 0x00 };
     ApplyCallPatch(ADDR_PLAYER_TRACE_CALL, playerTraceCall, (void*)FinalTraceWrapper, "player trace target offset hook");
+
+    if (g_PoliceIgnore) {
+        BYTE registerCrimeStart[6] = { 0x53, 0x55, 0x83, 0xEC, 0x10, 0x66 };
+        ApplyPatch(ADDR_REGISTER_CRIME, registerCrimeStart, g_Return12Patch, 6, "police ignore crime registration");
+
+        BYTE updateWantedStart[6] = { 0x8B, 0x15, 0xDC, 0x10, 0x69, 0x00 };
+        ApplyJumpPatch6(ADDR_UPDATE_WANTED_LEVEL, updateWantedStart, (void*)NoWantedUpdateWrapper, "police ignore wanted level clamp");
+    } else {
+        Log("Police ignore disabled.");
+    }
+
+    if (g_InfiniteAmmo) {
+        BYTE totalAmmoDecrement[3] = { 0xFF, 0x4E, 0x0C };
+        ApplyPatch(ADDR_TOTAL_AMMO_DECREMENT, totalAmmoDecrement, g_NOP3, 3, "infinite ammo reserve decrement");
+    } else {
+        Log("Infinite ammo disabled.");
+    }
 
     return 0;
 }
