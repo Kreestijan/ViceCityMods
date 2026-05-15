@@ -1,0 +1,12 @@
+*.asi
+*.dll
+*.exe
+*.obj
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
+.vs/
+build/
+dist/
