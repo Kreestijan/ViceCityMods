@@ -26,12 +26,20 @@ const DWORD ADDR_PLAYER_SPREAD_DEFAULT  = 0x0069D3A8; // used by most instant-hi
 const DWORD ADDR_PLAYER_SPREAD_WEAPON_B = 0x0069D440; // used by weapon type 0x1B
 const DWORD ADDR_PLAYER_SPREAD_WEAPON_A = 0x0069D444; // used by weapon types 0x1A, 0x20, 0x23
 
-// Final instant-hit trace call in FUN_005d1140.
-// This is a diagnostic/override hook that offsets the final target point after
-// the game has finished all normal aim and spread calculations.
+// Final trace hooks for FUN_005cee60 (all-in-one weapon fire function).
+// Both the NPC path (FUN_005d1140) and player path (FUN_005cbff0) call
+// FUN_005cee60 to compute trajectory and render visual tracers.
+// Our FinalTraceWrapper hook sits before FUN_005cee60 to apply endpoint
+// spread to the target position buffers, producing visual scatter.
 const DWORD ADDR_FINAL_TRACE_CALL = 0x005D2CAB;
 const DWORD ADDR_PLAYER_TRACE_CALL = 0x005CC1F1;
 const DWORD ADDR_FINAL_TRACE_FUNC = 0x005CEE60;
+
+// FUN_00573d40 (damage trace) call inside FUN_005cee60.
+// This is the actual hit-detection trace that determines where damage lands.
+// Hooking this lets us apply directional spread before the damage calc runs.
+const DWORD ADDR_DAMAGE_TRACE_CALL = 0x005CF1D5;
+const DWORD ADDR_DAMAGE_TRACE_FUNC = 0x00573D40;
 
 // Wanted-level crime accumulation routine. Returning before this function runs
 // prevents crimes from adding wanted points/stars.
@@ -363,6 +371,48 @@ bool BuildNoTargetEndpoint(float* start, float* end, DWORD* arg6Slot, DWORD* arg
     return true;
 }
 
+// Naked wrapper hooked at the CALL to FUN_00573d40 inside FUN_005cee60.
+// Applies angular spread to arg2 (the direction/endpoint vector) before
+// the damage trace runs, so hit detection uses the spread direction.
+// Stack layout at wrapper entry (4 PUSHes + CALL):
+//   [ESP+0] = return address (0x005CF1DA)
+//   [ESP+4] = arg1 (EBX = weapon type context)
+//   [ESP+8] = arg2 (EAX = &local_180 = direction/endpoint vector)
+//   [ESP+12] = arg3 (EDI)
+//   [ESP+16] = arg4
+extern "C" __declspec(naked) void DamageTraceWrapper() {
+    __asm {
+        pushad
+        // [ESP+32] = return address
+        // [ESP+40] = arg2 = &local_180 (direction vector pointer)
+        mov eax, [esp + 40]
+        test eax, eax
+        jz skip
+        push [esp + 32]
+        push eax
+        call ApplyDirectionSpread
+        add esp, 8
+skip:
+        popad
+        jmp ADDR_DAMAGE_TRACE_FUNC
+    }
+}
+
+extern "C" __declspec(naked) void NoWantedUpdateWrapper() {
+    __asm {
+        mov dword ptr [ecx], 0
+        mov dword ptr [ecx + 0x20], 0
+        mov byte ptr [ecx + 0x1A], 0
+        mov byte ptr [ecx + 0x19], 0
+        mov word ptr [ecx + 0x1C], 0
+        ret
+    }
+}
+
+// __stdcall callback that receives all FUN_005cee60 trace-site arguments.
+// Applies ApplyEndpointSpread/ApplyDirectionSpread to the output position buffers
+// so the subsequent tracer beam and trajectory math see the deviated endpoint.
+// The return address identifies which call site triggered this hook.
 extern "C" void __stdcall ApplyTraceSpread(DWORD callReturn, DWORD arg1, DWORD arg2, DWORD arg3, float* arg4, float* arg5, DWORD* arg6Slot, DWORD* arg7Slot) {
     if (g_SpreadDegrees <= 0.0f)
         return;
@@ -429,13 +479,15 @@ extern "C" void __stdcall ApplyTraceSpread(DWORD callReturn, DWORD arg1, DWORD a
     }
 }
 
+// Naked asm wrapper that hooks calls to FUN_005cee60.
+// Pushes all original args to ApplyTraceSpread, then jumps to the real function.
+// Stack at hook entry (right after the CALL instruction executes):
+//   [ESP+0] = return address (back into caller)
+//   [ESP+4] = arg1 .. [ESP+24] = arg7 (7 args pushed before CALL, in right-to-left order)
+// After pushad: [ESP+32] = return address, [ESP+36..60] = original args
 extern "C" __declspec(naked) void FinalTraceWrapper() {
     __asm {
         pushad
-        // Original stack after pushad:
-        // [esp+32] = return address, [esp+36..60] = trace args 1..7.
-        // Push right-to-left. After each push, the next original value is still
-        // at [esp+60], so this remains stable without scratch storage.
         lea eax, [esp + 60]
         push eax
         lea eax, [esp + 60]
@@ -449,17 +501,6 @@ extern "C" __declspec(naked) void FinalTraceWrapper() {
         call ApplyTraceSpread
         popad
         jmp ADDR_FINAL_TRACE_FUNC
-    }
-}
-
-extern "C" __declspec(naked) void NoWantedUpdateWrapper() {
-    __asm {
-        mov dword ptr [ecx], 0
-        mov dword ptr [ecx + 0x20], 0
-        mov byte ptr [ecx + 0x1A], 0
-        mov byte ptr [ecx + 0x19], 0
-        mov word ptr [ecx + 0x1C], 0
-        ret
     }
 }
 
@@ -577,11 +618,21 @@ DWORD WINAPI InitThread(LPVOID) {
     WriteFloat(ADDR_PLAYER_SPREAD_WEAPON_A, 0.0003f, g_PlayerSpread, "weapon 0x1A/0x20/0x23 spread");
     WriteFloat(ADDR_PLAYER_SPREAD_WEAPON_B, 0.00015f, g_PlayerSpread, "weapon 0x1B spread");
 
+    // --- Final trace hooks for FUN_005cee60 ---
+    // Hook both the NPC and player call sites so our ApplyTraceSpread can
+    // deviate the target endpoint before the game computes the trajectory.
     BYTE finalTraceCall[5] = { 0xE8, 0xB0, 0xC1, 0xFF, 0xFF };
     ApplyCallPatch(ADDR_FINAL_TRACE_CALL, finalTraceCall, (void*)FinalTraceWrapper, "final trace target offset hook");
 
     BYTE playerTraceCall[5] = { 0xE8, 0x6A, 0x2C, 0x00, 0x00 };
     ApplyCallPatch(ADDR_PLAYER_TRACE_CALL, playerTraceCall, (void*)FinalTraceWrapper, "player trace target offset hook");
+
+    // --- Damage trace hook ---
+    // Redirect the CALL to FUN_00573d40 inside FUN_005cee60 so we can apply
+    // directional spread to the endpoint vector before the damage calc runs.
+    // arg2 at the call site (EAX = &local_180) is the direction/endpoint pointer.
+    BYTE damageTraceCall[5] = { 0xE8, 0x66, 0x4B, 0xFA, 0xFF };
+    ApplyCallPatch(ADDR_DAMAGE_TRACE_CALL, damageTraceCall, (void*)DamageTraceWrapper, "damage trace direction spread");
 
     if (g_PoliceIgnore) {
         BYTE registerCrimeStart[6] = { 0x53, 0x55, 0x83, 0xEC, 0x10, 0x66 };
